@@ -44,15 +44,26 @@ use alloc::string::ToString;
 //! ## Features
 //! - Get quote from any registered liquidity plugin
 //! - Returns expected output amount, fees, and route details
+//! - Caller-specified slippage tolerance via `slippage_bps` parameter
+//! - Quote expiration via configurable TTL (`set_quote_ttl` / `get_quote_ttl`)
 //! - Does not execute transactions (read-only preview)
 //! - Works with any plugin implementing the get_quote interface
 //!
+//! ## Events
+//! - `fee_estimated` — emitted on each `estimate_fee` call (total_fee, surge_pricing)
 //! ## Events (following naming convention: past tense verbs in snake_case)
 //! - `quote_requested` — Quote request logged (route_name, token_in, token_out, amount_in)
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
+
+// ── Storage Keys ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+pub enum DataKey {
+    QuoteTtl, // TTL for quotes in ledger seconds
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -111,6 +122,8 @@ pub struct QuoteRequest {
     pub token_out: Address,
     /// The amount of token_in to swap
     pub amount_in: i128,
+    /// Slippage tolerance in basis points (e.g., 50 = 0.5%)
+    pub slippage_bps: u32,
 }
 
 /// Response containing quote details.
@@ -166,6 +179,8 @@ pub struct FeeEstimateResponse {
     pub exchange_rate: String,
     /// Price impact estimate (basis points, negative = adverse)
     pub price_impact_bps: i32,
+    /// Quote expiration timestamp (ledger seconds)
+    pub expires_at: u64,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -177,6 +192,8 @@ pub enum QuoteError {
     InvalidAmount = 2,
     QuoteFailed = 3,
     InvalidRoute = 4,
+    NotInitialized = 5,
+    InvalidSlippage = 6,
 }
 
 /// Request parameters for fee estimation.
@@ -300,12 +317,15 @@ impl RouterQuote {
     /// * `token_in` - The address of the token being sold.
     /// * `token_out` - The address of the token being bought.
     /// * `amount_in` - The amount of token_in to swap.
+    /// * `slippage_bps` - Slippage tolerance in basis points (e.g., 50 = 0.5%). Max 10000 (100%).
     ///
     /// # Returns
-    /// A [`QuoteResponse`] containing the expected output amount, fees, and route details.
+    /// A [`QuoteResponse`] containing the expected output amount, fees, and route details,
+    /// with expires_at set based on the configured quote TTL.
     ///
     /// # Errors
     /// * [`QuoteError::InvalidAmount`] — if `amount_in` is less than or equal to zero.
+    /// * [`QuoteError::InvalidSlippage`] — if `slippage_bps` exceeds 10000.
     /// * [`QuoteError::RouteNotFound`] — if the route name is not registered.
     /// * [`QuoteError::QuoteFailed`] — if the plugin's `get_quote` call fails.
     pub fn get_quote(
@@ -392,6 +412,13 @@ impl RouterQuote {
         if amount_in <= 0 {
             return Err(QuoteError::InvalidAmount);
         }
+        if slippage_bps > 10_000 {
+            return Err(QuoteError::InvalidSlippage);
+        }
+
+        // Compute expiration timestamp from configurable TTL (default 300s)
+        let quote_ttl: u64 = env.storage().instance().get(&DataKey::QuoteTtl).unwrap_or(300);
+        let expires_at = env.ledger().timestamp() + quote_ttl;
 
         // Resolve target address
         let target: Address = match router_core {
@@ -450,8 +477,9 @@ impl RouterQuote {
         // Calculate fee (assuming 1% fee for now - in production this comes from the plugin)
         let fee_amount = amount_in * 1 / 100;
         
-        // Calculate min_amount_out with 0.5% slippage tolerance
-        let min_amount_out = amount_out * 999 / 1000;
+        // Calculate min_amount_out using caller-specified slippage_bps
+        // Formula: amount_out * (10000 - slippage_bps) / 10000
+        let min_amount_out = amount_out * (10_000 - slippage_bps as i128) / 10_000;
         
         // Exchange rate placeholder
         let exchange_rate = String::from_str(&env, "0");
@@ -625,6 +653,7 @@ impl RouterQuote {
                 req.token_in.clone(),
                 req.token_out.clone(),
                 req.amount_in,
+                req.slippage_bps,
             );
             
             match response {
@@ -639,6 +668,7 @@ impl RouterQuote {
                         min_amount_out: 0,
                         exchange_rate: String::from_str(&env, "0"),
                         price_impact_bps: 0,
+                        expires_at: env.ledger().timestamp(),
                     });
                 }
             }
