@@ -16,6 +16,13 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
 
+// ── Storage Keys ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+pub enum DataKey {
+    QuoteTtl, // TTL for quotes in ledger seconds
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Request parameters for getting a quote.
@@ -50,6 +57,8 @@ pub struct QuoteResponse {
     pub exchange_rate: String,
     /// Price impact estimate (basis points, negative = adverse)
     pub price_impact_bps: i32,
+    /// Quote expiration timestamp (ledger seconds)
+    pub expires_at: u64,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -61,6 +70,7 @@ pub enum QuoteError {
     InvalidAmount = 2,
     QuoteFailed = 3,
     InvalidRoute = 4,
+    NotInitialized = 5,
 }
 
 /// Request parameters for fee estimation.
@@ -99,6 +109,23 @@ pub struct RouterQuote;
 
 #[contractimpl]
 impl RouterQuote {
+    /// Set the quote TTL (time-to-live) in ledger seconds.
+    ///
+    /// Configures how long quotes remain valid. Quotes will expire at
+    /// `current_ledger_timestamp + ttl_seconds`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `ttl_seconds` - Quote validity duration in ledger seconds.
+    pub fn set_quote_ttl(env: Env, ttl_seconds: u64) {
+        env.storage().instance().set(&DataKey::QuoteTtl, &ttl_seconds);
+    }
+
+    /// Get the current quote TTL in ledger seconds (default: 300).
+    pub fn get_quote_ttl(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::QuoteTtl).unwrap_or(300)
+    }
+
     /// Get a quote from a liquidity plugin.
     ///
     /// Resolves the route name to a contract address via router-core (if provided),
@@ -115,7 +142,8 @@ impl RouterQuote {
     /// * `amount_in` - The amount of token_in to swap.
     ///
     /// # Returns
-    /// A [`QuoteResponse`] containing the expected output amount, fees, and route details.
+    /// A [`QuoteResponse`] containing the expected output amount, fees, and route details,
+    /// with expires_at set based on the configured quote TTL.
     ///
     /// # Errors
     /// * [`QuoteError::InvalidAmount`] — if `amount_in` is less than or equal to zero.
@@ -133,6 +161,10 @@ impl RouterQuote {
         if amount_in <= 0 {
             return Err(QuoteError::InvalidAmount);
         }
+
+        // Compute expiration timestamp from configurable TTL (default 300s)
+        let quote_ttl: u64 = env.storage().instance().get(&DataKey::QuoteTtl).unwrap_or(300);
+        let expires_at = env.ledger().timestamp() + quote_ttl;
 
         // Resolve target address
         let target: Address = match router_core {
@@ -184,6 +216,7 @@ impl RouterQuote {
             min_amount_out,
             exchange_rate,
             price_impact_bps,
+            expires_at,
         })
     }
 
@@ -226,6 +259,7 @@ impl RouterQuote {
                         min_amount_out: 0,
                         exchange_rate: String::from_str(&env, "0"),
                         price_impact_bps: 0,
+                        expires_at: env.ledger().timestamp(),
                     });
                 }
             }
