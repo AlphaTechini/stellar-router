@@ -42,6 +42,8 @@ composable, upgradeable, and access-controlled multi-contract systems on Soroban
 | `router-middleware` | Rate limiting, route enable/disable, and call event logging | 6 |
 | `router-timelock` | Delayed execution queue for sensitive configuration changes | 7 |
 | `router-multicall` | Batch multiple cross-contract calls in one transaction | 6 |
+| `router-execution` | Execution pipeline with simulation, retries, and fee estimation | 8 |
+| `router-quote` | Read-only quote preview contract for expected output, fees, and route details | 4 |
 
 ## Metrics & Monitoring
 
@@ -203,9 +205,19 @@ stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/router_multicall.wasm \
   --network testnet --source <your-account>
 
-# 6. Deploy core last (depends on all others)
+# 6. Deploy core
 stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/router_core.wasm \
+  --network testnet --source <your-account>
+
+# 7. Deploy execution (depends on router-core)
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/router_execution.wasm \
+  --network testnet --source <your-account>
+
+# 8. Deploy quote last (depends on router-execution)
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/router_quote.wasm \
   --network testnet --source <your-account>
 ```
 
