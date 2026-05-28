@@ -1,13 +1,10 @@
-//! Testnet setup utilities for integration tests
-//!
-//! This module provides utilities for setting up and managing Stellar testnet
-//! accounts and contracts for integration testing.
+//! Shared integration test helpers for stellar-router.
 
 use std::env;
 use std::process::Command;
 use std::time::Duration;
 
-/// Configuration for testnet integration tests
+/// Configuration for Stellar testnet integration tests.
 #[derive(Debug, Clone)]
 pub struct TestnetConfig {
     pub network: String,
@@ -18,8 +15,7 @@ pub struct TestnetConfig {
 impl Default for TestnetConfig {
     fn default() -> Self {
         Self {
-            network: env::var("STELLAR_NETWORK")
-                .unwrap_or_else(|_| "testnet".to_string()),
+            network: env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string()),
             rpc_url: env::var("STELLAR_RPC_URL")
                 .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string()),
             network_passphrase: env::var("STELLAR_NETWORK_PASSPHRASE")
@@ -28,7 +24,7 @@ impl Default for TestnetConfig {
     }
 }
 
-/// Test account with keypair
+/// Test account with keypair.
 #[derive(Debug, Clone)]
 pub struct TestAccount {
     pub address: String,
@@ -36,7 +32,7 @@ pub struct TestAccount {
 }
 
 impl TestAccount {
-    /// Generate a new test account
+    /// Generate a new test account.
     pub fn generate() -> Result<Self, String> {
         let output = Command::new("stellar")
             .args(["keys", "generate", "--no-fund"])
@@ -53,7 +49,6 @@ impl TestAccount {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
 
-        // Parse output to extract address and secret
         let address = lines
             .iter()
             .find(|l| l.contains("Public key:"))
@@ -71,10 +66,8 @@ impl TestAccount {
         Ok(Self { address, secret })
     }
 
-    /// Fund this account using Friendbot
+    /// Fund this account using Friendbot.
     pub fn fund(&self, network: &str) -> Result<(), String> {
-        println!("Funding account {} via Friendbot on {}...", self.address, network);
-
         let output = Command::new("stellar")
             .args(["keys", "fund", &self.address, "--network", network])
             .output()
@@ -87,49 +80,28 @@ impl TestAccount {
             ));
         }
 
-        // Wait for funding to be confirmed
         std::thread::sleep(Duration::from_secs(2));
         Ok(())
     }
-
-    /// Get account balance
-    pub fn get_balance(&self, network: &str) -> Result<String, String> {
-        let output = Command::new("stellar")
-            .args([
-                "contract",
-                "invoke",
-                "--network",
-                network,
-                "--source",
-                &self.address,
-                "--",
-                "balance",
-            ])
-            .output()
-            .map_err(|e| format!("Failed to get balance: {}", e))?;
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
 }
 
-/// Deployed contract instance
+/// Deployed contract instance.
 #[derive(Debug, Clone)]
 pub struct DeployedContract {
     pub contract_id: String,
     pub wasm_path: String,
     pub name: String,
+    pub network: String,
 }
 
 impl DeployedContract {
-    /// Deploy a contract to testnet
+    /// Deploy a contract to testnet.
     pub fn deploy(
         wasm_path: &str,
         name: &str,
         source_account: &TestAccount,
         network: &str,
     ) -> Result<Self, String> {
-        println!("Deploying {} from {}...", name, wasm_path);
-
         let output = Command::new("stellar")
             .args([
                 "contract",
@@ -152,24 +124,22 @@ impl DeployedContract {
         }
 
         let contract_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        // Wait for deployment to be confirmed
         std::thread::sleep(Duration::from_secs(2));
 
         Ok(Self {
             contract_id,
             wasm_path: wasm_path.to_string(),
             name: name.to_string(),
+            network: network.to_string(),
         })
     }
 
-    /// Invoke a contract method
+    /// Invoke a contract method.
     pub fn invoke(
         &self,
         method: &str,
         args: &[&str],
         source_account: &TestAccount,
-        network: &str,
     ) -> Result<String, String> {
         let mut cmd_args = vec![
             "contract",
@@ -177,7 +147,7 @@ impl DeployedContract {
             "--id",
             &self.contract_id,
             "--network",
-            network,
+            &self.network,
             "--source",
             &source_account.address,
             "--",
@@ -200,13 +170,12 @@ impl DeployedContract {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Try to invoke a contract method, expecting it to fail
+    /// Try to invoke a contract method, expecting it to fail.
     pub fn try_invoke(
         &self,
         method: &str,
         args: &[&str],
         source_account: &TestAccount,
-        network: &str,
     ) -> Result<String, String> {
         let mut cmd_args = vec![
             "contract",
@@ -214,7 +183,7 @@ impl DeployedContract {
             "--id",
             &self.contract_id,
             "--network",
-            network,
+            &self.network,
             "--source",
             &source_account.address,
             "--",
@@ -238,8 +207,8 @@ impl DeployedContract {
     }
 }
 
-/// Test fixture managing all deployed contracts and accounts
-pub struct TestFixture {
+/// Shared integration-test fixture that deploys and initializes all contracts.
+pub struct TestSuite {
     pub config: TestnetConfig,
     pub admin: TestAccount,
     pub user1: TestAccount,
@@ -252,11 +221,43 @@ pub struct TestFixture {
     pub router_multicall: Option<DeployedContract>,
 }
 
-impl TestFixture {
-    /// Create a new test fixture with funded accounts
-    pub fn new() -> Result<Self, String> {
-        println!("Setting up test fixture...");
+impl TestSuite {
+    /// Build and fully initialize the suite.
+    pub fn setup() -> Result<Self, String> {
+        let mut suite = Self::new()?;
+        suite.deploy_all_contracts()?;
+        suite.initialize_all_contracts()?;
+        Ok(suite)
+    }
 
+    /// Optional cleanup hook for local runs.
+    pub fn teardown(&self) {
+        println!("Test suite teardown complete");
+    }
+
+    pub fn core(&self) -> Result<&DeployedContract, String> {
+        self.router_core.as_ref().ok_or("Core contract not deployed".to_string())
+    }
+
+    pub fn registry(&self) -> Result<&DeployedContract, String> {
+        self.router_registry
+            .as_ref()
+            .ok_or("Registry contract not deployed".to_string())
+    }
+
+    pub fn access(&self) -> Result<&DeployedContract, String> {
+        self.router_access
+            .as_ref()
+            .ok_or("Access contract not deployed".to_string())
+    }
+
+    pub fn middleware(&self) -> Result<&DeployedContract, String> {
+        self.router_middleware
+            .as_ref()
+            .ok_or("Middleware contract not deployed".to_string())
+    }
+
+    fn new() -> Result<Self, String> {
         let config = TestnetConfig::default();
 
         let admin = TestAccount::generate()?;
@@ -282,13 +283,9 @@ impl TestFixture {
         })
     }
 
-    /// Deploy all router contracts in dependency order
-    pub fn deploy_all_contracts(&mut self) -> Result<(), String> {
-        println!("Deploying all router contracts...");
-
+    fn deploy_all_contracts(&mut self) -> Result<(), String> {
         let network = &self.config.network;
 
-        // Deploy in dependency order
         self.router_registry = Some(DeployedContract::deploy(
             "target/wasm32-unknown-unknown/release/router_registry.wasm",
             "router-registry",
@@ -331,95 +328,52 @@ impl TestFixture {
             network,
         )?);
 
-        println!("All contracts deployed successfully!");
         Ok(())
     }
 
-    /// Initialize all contracts with default configuration
-    pub fn initialize_all_contracts(&self) -> Result<(), String> {
-        println!("Initializing all contracts...");
-
-        let network = &self.config.network;
-
-        // Initialize router-core
+    fn initialize_all_contracts(&self) -> Result<(), String> {
         if let Some(ref core) = self.router_core {
-            core.invoke("initialize", &["--admin", &self.admin.address], &self.admin, network)?;
-            println!("✓ router-core initialized");
+            core.invoke("initialize", &["--admin", &self.admin.address], &self.admin)?;
         }
 
-        // Initialize router-registry
         if let Some(ref registry) = self.router_registry {
-            registry.invoke("initialize", &["--admin", &self.admin.address], &self.admin, network)?;
-            println!("✓ router-registry initialized");
+            registry.invoke("initialize", &["--admin", &self.admin.address], &self.admin)?;
         }
 
-        // Initialize router-access
         if let Some(ref access) = self.router_access {
             access.invoke(
                 "initialize",
                 &["--super_admin", &self.admin.address],
                 &self.admin,
-                network,
             )?;
-            println!("✓ router-access initialized");
         }
 
-        // Initialize router-middleware
         if let Some(ref middleware) = self.router_middleware {
-            middleware.invoke("initialize", &["--admin", &self.admin.address], &self.admin, network)?;
-            println!("✓ router-middleware initialized");
+            middleware.invoke("initialize", &["--admin", &self.admin.address], &self.admin)?;
         }
 
-        // Initialize router-timelock
         if let Some(ref timelock) = self.router_timelock {
             timelock.invoke(
                 "initialize",
                 &["--admin", &self.admin.address, "--min_delay", "60"],
                 &self.admin,
-                network,
             )?;
-            println!("✓ router-timelock initialized");
         }
 
-        // Initialize router-multicall
         if let Some(ref multicall) = self.router_multicall {
             multicall.invoke(
                 "initialize",
                 &["--admin", &self.admin.address, "--max_batch_size", "10"],
                 &self.admin,
-                network,
             )?;
-            println!("✓ router-multicall initialized");
         }
 
-        println!("All contracts initialized successfully!");
         Ok(())
-    }
-
-    /// Clean up test resources (optional, for local testing)
-    pub fn cleanup(&self) {
-        println!("Test fixture cleanup complete");
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore] // Run with: cargo test --test integration -- --ignored
-    fn test_account_generation() {
-        let account = TestAccount::generate().expect("Failed to generate account");
-        assert!(!account.address.is_empty());
-        assert!(!account.secret.is_empty());
-        println!("Generated account: {}", account.address);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_account_funding() {
-        let account = TestAccount::generate().expect("Failed to generate account");
-        account.fund("testnet").expect("Failed to fund account");
-        println!("Funded account: {}", account.address);
+impl Drop for TestSuite {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }

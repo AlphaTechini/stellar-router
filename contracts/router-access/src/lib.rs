@@ -3,6 +3,38 @@
 //! # router-access
 //!
 //! Role-based access control for the stellar-router suite.
+//! Supports arbitrary roles, multi-admin, per-address whitelisting,
+//! and a role hierarchy where parent roles implicitly include child roles.
+//!
+//! ## Role Hierarchy
+//!
+//! Roles can be arranged in a parent → child relationship. Granting a parent
+//! role to an address implicitly grants all of its child roles (transitively).
+//! For example, if `admin` is the parent of `editor`, and `editor` is the
+//! parent of `viewer`, then an address with `admin` also has `editor` and
+//! `viewer` without needing explicit grants.
+//!
+//! ## Events (following naming convention: past tense verbs in snake_case)
+//! - `role_granted` — Role granted to address (role, account, expiry_timestamp)
+//! - `role_revoked` — Role revoked from address (role, target)
+//! - `role_parent_set` — Parent role set (role, parent_role)
+//! - `role_parent_removed` — Parent role removed (role, parent_role)
+//! - `role_admin_set` — Admin set for role (role, admin)
+//! - `address_blacklisted` — Address blacklisted (address)
+//! - `address_unblacklisted` — Address unblacklisted (address)
+//! - `role_expired` — Role grant expired (role, target)
+//! - `admin_transferred` — Admin transferred (old_admin, new_admin)
+//!
+//! The hierarchy is stored as a directed acyclic graph (DAG). Cycles are
+//! prevented by `set_role_parent` — a role cannot be set as its own ancestor.
+//!
+//! ## Storage model
+//!
+//! - `HasRole(role, address)` — explicit direct grant
+//! - `RoleParent(role)` — the single parent role of `role` (if any)
+//! - `RoleAdmin(role)` — address allowed to grant/revoke `role`
+
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Symbol};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
@@ -13,12 +45,21 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     SuperAdmin,
+    HasRole(String, Address),  // (role, address) -> bool  (direct grant only)
+    RoleAdmin(String),         // role -> Address who manages it
+    Blacklisted(Address),
+    RoleParent(String),        // role -> parent role name (hierarchy edge)
     HasRole(String, Address), // (role, address) -> bool
     RoleAdmin(String),        // role -> Address who manages it
     Blacklisted(Address),
-    RoleMembers(String),   // role -> Vec<Address>
+    RoleMembers(String),   // legacy role -> Vec<Address>
+    RoleMember(String, u32), // (role, index) -> Address
+    RoleMemberIndex(String, Address), // (role, account) -> index
+    RoleMemberCount(String), // role -> total indexed member count
     AddressRoles(Address), // address -> Vec<String>
     RoleExpiry(String, Address),
+    BlacklistReason(Address),
+    BlacklistExpiry(Address),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -33,6 +74,7 @@ pub enum AccessError {
     RoleNotFound = 5,
     Blacklisted = 6,
     CannotBlacklistAdmin = 7,
+    HierarchyCycle = 8,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -40,9 +82,16 @@ pub enum AccessError {
 #[contract]
 pub struct RouterAccess;
 
+// Maximum depth to walk when resolving inherited roles. Prevents infinite
+// loops in the unlikely event of a storage inconsistency.
+const MAX_HIERARCHY_DEPTH: u32 = 16;
+
 #[contractimpl]
 impl RouterAccess {
     /// Initialize with a super-admin.
+    ///
+    /// # Errors
+    /// * [`AccessError::AlreadyInitialized`] — called more than once.
     pub fn initialize(env: Env, super_admin: Address) -> Result<(), AccessError> {
         if env.storage().instance().has(&DataKey::SuperAdmin) {
             return Err(AccessError::AlreadyInitialized);
@@ -53,6 +102,15 @@ impl RouterAccess {
         Ok(())
     }
 
+    /// Grant a role to an address. Caller must be super-admin or role admin.
+    ///
+    /// Only the direct role is stored. Inherited roles are resolved at
+    /// check time via [`Self::has_role`].
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    /// * [`AccessError::AlreadyHasRole`] — target already holds the role directly.
+    /// * [`AccessError::Blacklisted`] — target is blacklisted.
     /// Grant a role to an address.
     pub fn grant_role(
         env: Env,
@@ -64,6 +122,7 @@ impl RouterAccess {
         admin.require_auth();
         Self::require_role_manager(&env, &admin, &role)?;
 
+        if Self::has_direct_role(&env, &role, &target) {
         if Self::is_blacklisted_internal(&env, &account) {
             return Err(AccessError::Blacklisted);
         }
@@ -81,18 +140,27 @@ impl RouterAccess {
             .instance()
             .set(&DataKey::HasRole(role.clone(), account.clone()), &true);
 
-        // Add to RoleMembers list (if not already present)
-        let mut members: Vec<Address> = env
+        // Add to indexed member storage (append-only; stale entries filtered at read time)
+        if !env
             .storage()
             .instance()
-            .get(&DataKey::RoleMembers(role.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        if !members.iter().any(|a| a == account) {
-            members.push_back(account.clone());
+            .has(&DataKey::RoleMemberIndex(role.clone(), account.clone()))
+        {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoleMemberCount(role.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMember(role.clone(), count), &account);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMemberIndex(role.clone(), account.clone()), &count);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMemberCount(role.clone()), &(count + 1));
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RoleMembers(role.clone()), &members);
 
         // Add to AddressRoles list (if not already present)
         let mut roles: Vec<String> = env
@@ -105,6 +173,11 @@ impl RouterAccess {
         }
         env.storage()
             .instance()
+            .set(&DataKey::HasRole(role.clone(), target.clone()), &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "role_granted"),),
+            (role, target),
             .set(&DataKey::AddressRoles(account.clone()), &roles);
 
         // Set expiry timestamp
@@ -112,12 +185,20 @@ impl RouterAccess {
         env.storage().instance().set(&key, &expiry_timestamp);
 
         env.events().publish(
-            (Symbol::new(&env, "role_grant"),),
+            (Symbol::new(&env, "role_granted"),),
             (account, role, expiry_timestamp),
         );
         Ok(())
     }
 
+    /// Revoke a direct role grant from an address.
+    ///
+    /// Only removes the direct grant. If the address inherits the role via
+    /// the hierarchy it will still pass `has_role` checks.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    /// * [`AccessError::RoleNotFound`] — target does not hold the role directly.
     /// Removes `role` from `target`.
     pub fn revoke_role(
         env: Env,
@@ -137,7 +218,100 @@ impl RouterAccess {
         }
 
         env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleExpiry(role.clone(), target.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
 
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"),),
+            (role, target),
+        );
+        Ok(())
+    }
+
+    /// Check if an address has a role — either directly or via the hierarchy.
+    ///
+    /// Walks the role's ancestor chain. Returns `true` if the address holds
+    /// any role in the chain from `role` up to the root.
+    pub fn has_role(env: Env, role: String, target: Address) -> bool {
+        if Self::is_blacklisted_internal(&env, &target) {
+            return false;
+        }
+        Self::has_role_internal(&env, &role, &target)
+    }
+
+    /// Set the parent role for a role (defines the hierarchy edge).
+    ///
+    /// After this call, any address that holds `parent_role` (directly or
+    /// via inheritance) will also pass `has_role` checks for `role`.
+    ///
+    /// Only the super-admin can modify the hierarchy.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not the super-admin.
+    /// * [`AccessError::HierarchyCycle`] — setting this parent would create a cycle.
+    pub fn set_role_parent(
+        env: Env,
+        caller: Address,
+        role: String,
+        parent_role: String,
+    ) -> Result<(), AccessError> {
+        caller.require_auth();
+        Self::require_super_admin(&env, &caller)?;
+
+        // Prevent cycles: parent_role must not be a descendant of role.
+        // Equivalently, role must not appear in parent_role's ancestor chain.
+        if Self::is_ancestor(&env, &parent_role, &role) {
+            return Err(AccessError::HierarchyCycle);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleParent(role.clone()), &parent_role);
+
+        env.events().publish(
+            (Symbol::new(&env, "role_parent_set"),),
+            (role, parent_role),
+        );
+        Ok(())
+    }
+
+    /// Remove the parent relationship for a role.
+    ///
+    /// After this call, `role` becomes a root role with no parent.
+    /// Only the super-admin can modify the hierarchy.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not the super-admin.
+    pub fn remove_role_parent(
+        env: Env,
+        caller: Address,
+        role: String,
+    ) -> Result<(), AccessError> {
+        caller.require_auth();
+        Self::require_super_admin(&env, &caller)?;
+        env.storage().instance().remove(&DataKey::RoleParent(role.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "role_parent_removed"),),
+            role,
+        );
+        Ok(())
+    }
+
+    /// Get the direct parent role of a role, if one is set.
+    pub fn get_role_parent(env: Env, role: String) -> Option<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RoleParent(role))
+    }
+
+    /// Set the admin for a specific role (who can grant/revoke it).
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not the super-admin.
         let mut members: Vec<Address> = env
             .storage()
             .instance()
@@ -225,6 +399,11 @@ impl RouterAccess {
         Ok(())
     }
 
+    /// Blacklist an address — prevents it from being granted any role.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not the super-admin.
+    /// * [`AccessError::CannotBlacklistAdmin`] — target is the super-admin.
     /// Returns the role admin for the given role, or None if none is set.
     pub fn get_role_admin(env: Env, role: String) -> Option<Address> {
         env.storage()
@@ -233,7 +412,13 @@ impl RouterAccess {
     }
 
     /// Blacklist an address.
-    pub fn blacklist(env: Env, caller: Address, target: Address) -> Result<(), AccessError> {
+    pub fn blacklist(
+        env: Env,
+        caller: Address,
+        target: Address,
+        reason: Option<String>,
+        expires_at: Option<u64>,
+    ) -> Result<(), AccessError> {
         caller.require_auth();
         Self::require_super_admin(&env, &caller)?;
 
@@ -246,21 +431,42 @@ impl RouterAccess {
             return Err(AccessError::CannotBlacklistAdmin);
         }
 
+        // Default storage of a blacklist entry; reason and expiry are optional
         env.storage()
             .instance()
             .set(&DataKey::Blacklisted(target.clone()), &true);
-        env.events()
-            .publish((Symbol::new(&env, "address_blacklisted"),), target);
+
+        if let Some(r) = reason {
+            env.storage()
+                .instance()
+                .set(&DataKey::BlacklistReason(target.clone()), &r);
+        }
+
+        if let Some(exp) = expires_at {
+            env.storage()
+                .instance()
+                .set(&DataKey::BlacklistExpiry(target.clone()), &exp);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "address_blacklisted"),),
+            (target, reason, expires_at),
+        );
+
         Ok(())
     }
 
+    /// Remove an address from the blacklist.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not the super-admin.
     /// Remove from blacklist.
     pub fn unblacklist(env: Env, caller: Address, target: Address) -> Result<(), AccessError> {
         caller.require_auth();
         Self::require_super_admin(&env, &caller)?;
-        env.storage()
-            .instance()
-            .remove(&DataKey::Blacklisted(target.clone()));
+        env.storage().instance().remove(&DataKey::Blacklisted(target.clone()));
+        env.storage().instance().remove(&DataKey::BlacklistReason(target.clone()));
+        env.storage().instance().remove(&DataKey::BlacklistExpiry(target.clone()));
         env.events()
             .publish((Symbol::new(&env, "address_unblacklisted"),), target);
         Ok(())
@@ -270,25 +476,71 @@ impl RouterAccess {
         Self::is_blacklisted_internal(&env, &target)
     }
 
+    /// Transfer super-admin to a new address.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not the current super-admin.
     fn is_blacklisted_internal(env: &Env, target: &Address) -> bool {
-        env.storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::Blacklisted(target.clone()))
-            .unwrap_or(false)
-    }
-
-    pub fn get_role_members(env: Env, role: String) -> Vec<Address> {
-        let all_members: Vec<Address> = env
+        let is_blacklisted = env
             .storage()
             .instance()
-            .get(&DataKey::RoleMembers(role.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+            .get::<DataKey, bool>(&DataKey::Blacklisted(target.clone()))
+            .unwrap_or(false);
 
-        // Filter out expired roles
+        if !is_blacklisted {
+            return false;
+        }
+
+        // If an expiry is set and has passed, treat as not blacklisted and clean up
+        if let Some(expires_at) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::BlacklistExpiry(target.clone()))
+        {
+            let current_timestamp = env.ledger().timestamp();
+            if current_timestamp >= expires_at {
+                // Expired: remove stored blacklist data
+                env.storage().instance().remove(&DataKey::Blacklisted(target.clone()));
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::BlacklistExpiry(target.clone()));
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::BlacklistReason(target.clone()));
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn get_role_members(env: Env, role: String, offset: u32, limit: u32) -> Vec<Address> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleMemberCount(role.clone()))
+            .unwrap_or(0);
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let end = core::cmp::min(total, offset.saturating_add(limit));
         let mut active_members = Vec::new(&env);
-        for member in all_members.iter() {
-            if Self::has_role_internal(&env, &member, &role) {
-                active_members.push_back(member.clone());
+
+        // Paginate over indexed members and filter out revoked/expired entries.
+        for i in offset..end {
+            if let Some(member) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::RoleMember(role.clone(), i))
+            {
+                if Self::has_role_internal(&env, &role, &member) {
+                    active_members.push_back(member);
+                }
             }
         }
         active_members
@@ -308,6 +560,7 @@ impl RouterAccess {
     ) -> Result<(), AccessError> {
         current.require_auth();
         Self::require_super_admin(&env, &current)?;
+        env.storage().instance().set(&DataKey::SuperAdmin, &new_admin);
         env.storage()
             .instance()
             .set(&DataKey::SuperAdmin, &new_admin);
@@ -318,6 +571,10 @@ impl RouterAccess {
         Ok(())
     }
 
+    /// Get current super-admin.
+    ///
+    /// # Errors
+    /// * [`AccessError::NotInitialized`] — contract not initialized.
     pub fn super_admin(env: Env) -> Result<Address, AccessError> {
         env.storage()
             .instance()
@@ -339,6 +596,9 @@ impl RouterAccess {
         env.storage()
             .instance()
             .remove(&DataKey::HasRole(role.clone(), target.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
         env.events()
             .publish((Symbol::new(&env, "role_expired"),), (role, target));
         Ok(())
@@ -359,6 +619,7 @@ impl RouterAccess {
     }
 
     fn require_role_manager(env: &Env, caller: &Address, role: &String) -> Result<(), AccessError> {
+        if let Some(admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::SuperAdmin) {
         if Self::is_blacklisted_internal(env, caller) {
             return Err(AccessError::Blacklisted);
         }
@@ -383,6 +644,9 @@ impl RouterAccess {
         Err(AccessError::Unauthorized)
     }
 
+    /// Returns true if `target` holds `role` directly (no hierarchy walk).
+    fn has_direct_role(env: &Env, role: &String, target: &Address) -> bool {
+        env.storage()
     fn has_role_internal(env: &Env, account: &Address, role: &String) -> bool {
         if Self::is_blacklisted_internal(env, account) {
             return false;
@@ -394,6 +658,60 @@ impl RouterAccess {
             .get::<DataKey, bool>(&DataKey::HasRole(role.clone(), account.clone()))
             .unwrap_or(false);
 
+    /// Returns true if `target` holds `role` directly OR via the hierarchy.
+    ///
+    /// Walks up the ancestor chain of `role`. At each level, checks whether
+    /// `target` has a direct grant for that ancestor. Stops at depth
+    /// `MAX_HIERARCHY_DEPTH` to guard against storage inconsistencies.
+    fn has_role_internal(env: &Env, role: &String, target: &Address) -> bool {
+        let mut current = role.clone();
+        let mut depth = 0u32;
+
+        loop {
+            // Direct grant at this level?
+            if Self::has_direct_role(env, &current, target) {
+                return true;
+            }
+
+            // Walk up to parent
+            match env.storage().instance().get::<DataKey, String>(&DataKey::RoleParent(current)) {
+                Some(parent) => {
+                    depth += 1;
+                    if depth >= MAX_HIERARCHY_DEPTH {
+                        return false;
+                    }
+                    current = parent;
+                }
+                None => return false,
+            }
+        }
+    }
+
+    /// Returns true if `ancestor` is an ancestor of `role` in the hierarchy.
+    /// Used by `set_role_parent` to detect cycles.
+    fn is_ancestor(env: &Env, role: &String, ancestor: &String) -> bool {
+        let mut current = role.clone();
+        let mut depth = 0u32;
+
+        loop {
+            if &current == ancestor {
+                return true;
+            }
+            match env.storage().instance().get::<DataKey, String>(&DataKey::RoleParent(current)) {
+                Some(parent) => {
+                    depth += 1;
+                    if depth >= MAX_HIERARCHY_DEPTH {
+                        return false;
+                    }
+                    current = parent;
+                }
+                None => return false,
+            }
+        }
+    }
+
+    fn is_blacklisted_internal(env: &Env, target: &Address) -> bool {
+        env.storage()
         if !has_role {
             return false;
         }
@@ -435,6 +753,7 @@ mod tests {
         (env, admin, client)
     }
 
+    // ── Existing tests ────────────────────────────────────────────────────────
     // ... (all your existing tests remain unchanged) ...
 
     #[test]
@@ -487,7 +806,7 @@ mod tests {
         let blacklisted_addr = Address::generate(&env);
 
         // Blacklist the address
-        client.blacklist(&admin, &blacklisted_addr);
+        client.blacklist(&admin, &blacklisted_addr, &None::<String>, &None);
 
         // Try to set blacklisted address as role admin
         let result = client.try_set_role_admin(&admin, &role, &blacklisted_addr);
@@ -524,7 +843,7 @@ mod tests {
         client.set_role_admin(&admin, &role, &attacker);
 
         // Blacklist the attacker
-        client.blacklist(&admin, &attacker);
+        client.blacklist(&admin, &attacker, &None::<String>, &None);
 
         // Try to grant role - should fail with Blacklisted
         let result = client.try_grant_role(&attacker, &victim, &role, &None);
@@ -546,7 +865,7 @@ mod tests {
             .grant_role(&admin, &victim, &role, &None);
 
         // Blacklist the attacker
-        client.blacklist(&admin, &attacker);
+        client.blacklist(&admin, &attacker, &None::<String>, &None);
 
         // Try to revoke role - should fail with Blacklisted
         let result = client.try_revoke_role(&attacker, &role, &victim);
@@ -604,7 +923,7 @@ mod tests {
         let user2 = Address::generate(&env);
 
         // Initially, role should have no members
-        let members_before = client.get_role_members(&role);
+        let members_before = client.get_role_members(&role, &0, &50);
         assert!(members_before.is_empty());
 
         // Grant role to user1
@@ -612,7 +931,7 @@ mod tests {
             .grant_role(&admin, &user1, &role, &None);
 
         // Check that user1 is in role members
-        let members_after_first = client.get_role_members(&role);
+        let members_after_first = client.get_role_members(&role, &0, &50);
         assert_eq!(members_after_first.len(), 1);
         assert!(members_after_first.contains(&user1));
 
@@ -621,7 +940,7 @@ mod tests {
             .grant_role(&admin, &user2, &role, &None);
 
         // Check that both users are in role members
-        let members_after_second = client.get_role_members(&role);
+        let members_after_second = client.get_role_members(&role, &0, &50);
         assert_eq!(members_after_second.len(), 2);
         assert!(members_after_second.contains(&user1));
         assert!(members_after_second.contains(&user2));
@@ -635,7 +954,7 @@ mod tests {
         let role = String::from_str(&env, "operator");
         let blacklisted_user = Address::generate(&env);
 
-        client.blacklist(&admin, &blacklisted_user);
+        client.blacklist(&admin, &blacklisted_user, &None::<String>, &None);
 
         let result = client.try_grant_role(&admin, &blacklisted_user, &role, &None);
         assert_eq!(result, Err(Ok(AccessError::Blacklisted)));
@@ -674,7 +993,7 @@ mod tests {
         client.grant_role(&admin, &user, &role, &None);
         assert!(client.has_role(&user, &role));
 
-        client.blacklist(&admin, &user);
+        client.blacklist(&admin, &user, &None::<String>, &None);
         assert!(!client.has_role(&user, &role));
 
         client.unblacklist(&admin, &user);
@@ -845,7 +1164,7 @@ mod tests {
         client.grant_role(&admin, &user, &role, &Some(10));
 
         // Verify user is initially in role members
-        let members_before = client.get_role_members(&role);
+        let members_before = client.get_role_members(&role, &0, &50);
         assert!(members_before.contains(&user));
         assert_eq!(members_before.len(), 1);
 
@@ -856,9 +1175,26 @@ mod tests {
         assert!(!client.has_role(&user, &role));
 
         // get_role_members should not contain the expired user
-        let members_after = client.get_role_members(&role);
+        let members_after = client.get_role_members(&role, &0, &50);
         assert!(!members_after.contains(&user));
         assert!(members_after.is_empty());
+    }
+
+    #[test]
+    fn test_get_role_members_supports_offset_limit_pagination() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+
+        client.grant_role(&admin, &user1, &role, &None);
+        client.grant_role(&admin, &user2, &role, &None);
+        client.grant_role(&admin, &user3, &role, &None);
+
+        let page = client.get_role_members(&role, &1, &1);
+        assert_eq!(page.len(), 1);
+        assert!(page.contains(&user2));
     }
 
     #[test]
@@ -916,5 +1252,134 @@ mod tests {
         let user = Address::generate(&env);
         client.grant_role(&admin, &user, &role, &None);
         assert_eq!(client.get_role_expiry(&role, &user), Some(u64::MAX));
+    // ── Role hierarchy tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_parent_role_grants_child_access() {
+        let (env, admin, client) = setup();
+        let viewer = String::from_str(&env, "viewer");
+        let editor = String::from_str(&env, "editor");
+        let user = Address::generate(&env);
+
+        // editor is parent of viewer: editor → viewer
+        client.set_role_parent(&admin, &viewer, &editor);
+
+        // Grant editor to user
+        client.grant_role(&admin, &editor, &user);
+
+        // User should have both editor (direct) and viewer (inherited)
+        assert!(client.has_role(&editor, &user));
+        assert!(client.has_role(&viewer, &user));
+    }
+
+    #[test]
+    fn test_transitive_hierarchy() {
+        let (env, admin, client) = setup();
+        let viewer = String::from_str(&env, "viewer");
+        let editor = String::from_str(&env, "editor");
+        let admin_role = String::from_str(&env, "admin");
+        let user = Address::generate(&env);
+
+        // admin → editor → viewer
+        client.set_role_parent(&admin, &editor, &admin_role);
+        client.set_role_parent(&admin, &viewer, &editor);
+
+        // Grant admin to user
+        client.grant_role(&admin, &admin_role, &user);
+
+        // User should have all three roles
+        assert!(client.has_role(&admin_role, &user));
+        assert!(client.has_role(&editor, &user));
+        assert!(client.has_role(&viewer, &user));
+    }
+
+    #[test]
+    fn test_no_inheritance_without_parent() {
+        let (env, admin, client) = setup();
+        let viewer = String::from_str(&env, "viewer");
+        let editor = String::from_str(&env, "editor");
+        let user = Address::generate(&env);
+
+        // No parent set — roles are independent
+        client.grant_role(&admin, &editor, &user);
+        assert!(client.has_role(&editor, &user));
+        assert!(!client.has_role(&viewer, &user));
+    }
+
+    #[test]
+    fn test_set_role_parent_cycle_fails() {
+        let (env, admin, client) = setup();
+        let a = String::from_str(&env, "a");
+        let b = String::from_str(&env, "b");
+
+        // a → b
+        client.set_role_parent(&admin, &b, &a);
+
+        // b → a would create a cycle
+        let result = client.try_set_role_parent(&admin, &a, &b);
+        assert_eq!(result, Err(Ok(AccessError::HierarchyCycle)));
+    }
+
+    #[test]
+    fn test_self_cycle_fails() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "admin");
+        let result = client.try_set_role_parent(&admin, &role, &role);
+        assert_eq!(result, Err(Ok(AccessError::HierarchyCycle)));
+    }
+
+    #[test]
+    fn test_remove_role_parent_breaks_inheritance() {
+        let (env, admin, client) = setup();
+        let viewer = String::from_str(&env, "viewer");
+        let editor = String::from_str(&env, "editor");
+        let user = Address::generate(&env);
+
+        client.set_role_parent(&admin, &viewer, &editor);
+        client.grant_role(&admin, &editor, &user);
+        assert!(client.has_role(&viewer, &user));
+
+        // Remove the parent link
+        client.remove_role_parent(&admin, &viewer);
+        assert!(!client.has_role(&viewer, &user));
+        // Direct role still works
+        assert!(client.has_role(&editor, &user));
+    }
+
+    #[test]
+    fn test_get_role_parent() {
+        let (env, admin, client) = setup();
+        let viewer = String::from_str(&env, "viewer");
+        let editor = String::from_str(&env, "editor");
+
+        assert_eq!(client.get_role_parent(&viewer), None);
+        client.set_role_parent(&admin, &viewer, &editor);
+        assert_eq!(client.get_role_parent(&viewer), Some(editor));
+    }
+
+    #[test]
+    fn test_blacklisted_user_fails_has_role_even_with_hierarchy() {
+        let (env, admin, client) = setup();
+        let viewer = String::from_str(&env, "viewer");
+        let editor = String::from_str(&env, "editor");
+        let user = Address::generate(&env);
+
+        client.set_role_parent(&admin, &viewer, &editor);
+        client.grant_role(&admin, &editor, &user);
+        assert!(client.has_role(&viewer, &user));
+
+        client.blacklist(&admin, &user);
+        assert!(!client.has_role(&viewer, &user));
+        assert!(!client.has_role(&editor, &user));
+    }
+
+    #[test]
+    fn test_unauthorized_set_role_parent_fails() {
+        let (env, _admin, client) = setup();
+        let attacker = Address::generate(&env);
+        let a = String::from_str(&env, "a");
+        let b = String::from_str(&env, "b");
+        let result = client.try_set_role_parent(&attacker, &a, &b);
+        assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
     }
 }

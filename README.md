@@ -7,29 +7,86 @@ A modular cross-contract routing infrastructure suite for Stellar/Soroban.
 `stellar-router` provides a complete set of infrastructure primitives for building
 composable, upgradeable, and access-controlled multi-contract systems on Soroban.
 
+### System Architecture
+
+```mermaid
+graph TD
+    %% User/External Interaction
+    User([User / Client Application])
+    API[API Server]
+    Metrics[Metrics Exporter]
+
+    %% Core Components
+    subgraph "On-Chain Infrastructure (Soroban)"
+        Core[router-core]
+        Registry[router-registry]
+        Access[router-access]
+        Middleware[router-middleware]
+        Timelock[router-timelock]
+        Multicall[router-multicall]
+        Execution[router-execution]
+        Quote[router-quote]
+    end
+
+    %% External Systems
+    RPC[Stellar RPC Node]
+    Prometheus[(Prometheus / Grafana)]
+
+    %% Connections
+    User --> API
+    API --> RPC
+    RPC <--> Core
+    
+    %% Internal Dependency/Flow
+    Core --> Registry : lookup address
+    Core --> Access : verify permissions
+    Core --> Middleware : pre/post call hooks
+    Core --> Timelock : queue sensitive changes
+    
+    Execution --> Core : resolve routes
+    Quote --> Execution : simulate flow
+    
+    Multicall --> Core : batch resolution
+    
+    %% Monitoring Flow
+    Metrics --> RPC : poll contract state
+    Metrics --> Prometheus : expose metrics
+    API -.-> Prometheus : query for dashboards
+    
+    %% Styling
+    style Core fill:#f9f,stroke:#333,stroke-width:4px
+    style Registry fill:#dfd,stroke:#333
+    style Access fill:#dfd,stroke:#333
+    style Middleware fill:#ffd,stroke:#333
+    style Timelock fill:#ffd,stroke:#333
+    style Execution fill:#ddf,stroke:#333
+    style Quote fill:#ddf,stroke:#333
 ```
-┌─────────────────────────────────────────────────────┐
-│                    router-core                      │
-│         Central dispatcher & route resolver         │
-└────────────┬────────────────────────┬───────────────┘
-             │                        │
-    ┌────────▼────────┐      ┌────────▼────────┐
-    │ router-registry │      │  router-access  │
-    │ Contract address│      │  Role-based ACL │
-    │ versioning      │      │  & whitelisting │
-    └─────────────────┘      └─────────────────┘
-             │                        │
-    ┌────────▼────────┐      ┌────────▼────────┐
-    │router-middleware│      │router-timelock  │
-    │ Rate limiting   │      │ Delayed change  │
-    │ Call logging    │      │ execution queue │
-    └─────────────────┘      └─────────────────┘
-                      │
-             ┌────────▼────────┐
-             │router-multicall │
-             │ Batch calls in  │
-             │ one transaction │
-             └─────────────────┘
+
+### Route Resolution Flow
+
+```mermaid
+sequenceDiagram
+    participant User as Caller
+    participant Core as router-core
+    participant Registry as router-registry
+    participant Access as router-access
+    participant MW as router-middleware
+    participant Target as Target Contract
+
+    User->>Core: resolve(route_name)
+    Core->>Access: check_auth(caller, route)
+    Access-->>Core: authorized
+    Core->>MW: pre_call(route_name)
+    MW-->>Core: ok (rate limit check)
+    Core->>Registry: get_latest(route_name)
+    Registry-->>Core: address: v2.1.0
+    Core-->>User: address
+    
+    Note over User, Target: Optional Execution Flow
+    User->>Target: call(params)
+    Core->>MW: post_call(route_name)
+    MW-->>Core: log event
 ```
 
 ## Contracts
@@ -42,6 +99,8 @@ composable, upgradeable, and access-controlled multi-contract systems on Soroban
 | `router-middleware` | Rate limiting, route enable/disable, and call event logging | 6 |
 | `router-timelock` | Delayed execution queue for sensitive configuration changes | 7 |
 | `router-multicall` | Batch multiple cross-contract calls in one transaction | 6 |
+| `router-execution` | Execution pipeline with simulation, retries, and fee estimation | 8 |
+| `router-quote` | Read-only quote preview contract for expected output, fees, and route details | 4 |
 
 ## Metrics & Monitoring
 
@@ -97,14 +156,45 @@ setting `max_batch_size`).
 ## Getting Started
 
 ### Prerequisites
-- Rust (stable)
-- Soroban CLI: `cargo install --locked stellar-cli`
 
-### Build
+| Tool | Install |
+|---|---|
+| Rust (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| wasm32 target | `rustup target add wasm32-unknown-unknown` |
+| Stellar CLI | `cargo install --locked stellar-cli` |
+| Docker (optional) | [docs.docker.com](https://docs.docker.com/get-docker/) |
+
+### Quick Start (Docker)
+
+The fastest way to get a working environment with no local Rust install:
 
 ```bash
 git clone https://github.com/Maki-Zeninn/stellar-router.git
 cd stellar-router
+
+# Run all unit tests
+docker compose run tests
+
+# Build WASM contract artifacts (output → ./artifacts/)
+docker compose run wasm
+
+# Start metrics stack (exporter + Prometheus + Grafana)
+docker compose up
+```
+
+Grafana is available at http://localhost:3000 (admin / admin).
+Prometheus is available at http://localhost:9091.
+
+### Manual Setup
+
+```bash
+git clone https://github.com/Maki-Zeninn/stellar-router.git
+cd stellar-router
+```
+
+### Build
+
+```bash
 cargo build
 ```
 
@@ -172,9 +262,19 @@ stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/router_multicall.wasm \
   --network testnet --source <your-account>
 
-# 6. Deploy core last (depends on all others)
+# 6. Deploy core
 stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/router_core.wasm \
+  --network testnet --source <your-account>
+
+# 7. Deploy execution (depends on router-core)
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/router_execution.wasm \
+  --network testnet --source <your-account>
+
+# 8. Deploy quote last (depends on router-execution)
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/router_quote.wasm \
   --network testnet --source <your-account>
 ```
 
@@ -235,13 +335,46 @@ stellar contract invoke --id <MIDDLEWARE_ID> --network testnet --source admin \
 ### Queue a timelock operation
 
 ```bash
+# 1. Queue the operation (delay = 86400 seconds = 24 hours)
 stellar contract invoke --id <TIMELOCK_ID> --network testnet --source admin \
   -- queue \
   --proposer <ADMIN_ADDRESS> \
   --description "upgrade oracle to v2" \
   --target <NEW_ORACLE_ADDRESS> \
   --delay 86400
+
+# 2. Wait for the delay to pass (24 hours on testnet)
+
+# 3. Execute the operation after the ETA
+stellar contract invoke --id <TIMELOCK_ID> --network testnet --source admin \
+  -- execute \
+  --caller <ADMIN_ADDRESS> \
+  --op_id <OP_ID_FROM_QUEUE>
+
+# Or cancel it before execution
+stellar contract invoke --id <TIMELOCK_ID> --network testnet --source admin \
+  -- cancel \
+  --caller <ADMIN_ADDRESS> \
+  --op_id <OP_ID_FROM_QUEUE>
 ```
+
+## Troubleshooting
+
+**`cargo build` fails with `wasm32-unknown-unknown` target not found**
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+**`stellar contract deploy` fails with "account not found"**
+Fund your testnet account using [Stellar Friendbot](https://friendbot.stellar.org/?addr=<YOUR_ADDRESS>).
+
+**Metrics exporter shows no data**
+- Verify the contract IDs are correct and the contracts are initialized.
+- Check that `ROUTER_RPC_URL` points to a live Soroban RPC endpoint.
+- Run `docker compose logs metrics-exporter` to see scrape errors.
+
+**Tests fail with "AlreadyInitialized"**
+Each test must use a fresh `Env::default()` and register a new contract instance. The Soroban test environment is isolated per `Env`, so this should not happen unless a test helper is reusing state.
 
 ## FAQ
 

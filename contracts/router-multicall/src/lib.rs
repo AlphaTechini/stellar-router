@@ -10,6 +10,12 @@
 //! - Per-call success/failure tracking (non-atomic mode)
 //! - Atomic mode: revert all if any call fails
 //! - Call result storage for async inspection
+//!
+//! ## Events (following naming convention: past tense verbs in snake_case)
+//! - `call_result` — Individual call result logged (caller, target, function, success)
+//! - `batch_executed` — Batch execution completed (summary_data)
+//! - `max_batch_size_updated` — Max batch size updated (old_size, new_size)
+//! - `admin_transferred` — Admin transferred (old_admin, new_admin)
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
@@ -347,11 +353,7 @@ impl RouterMulticall {
     pub fn transfer_admin(env: Env, current: Address, new_admin: Address) -> Result<(), MulticallError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish(
-            (Symbol::new(&env, "admin_transferred"),),
-            (current, new_admin),
-        );
+        router_common::admin_transfer_complete!(&env, &current, &new_admin, &DataKey::Admin);
         Ok(())
     }
 

@@ -11,6 +11,11 @@
 //! - Retry logic for transient (network) failures
 //! - Centralized error event logging
 //! - Fee estimation endpoint with edge-case handling
+//!
+//! ## Events (following naming convention: past tense verbs in snake_case)
+//! - `execution_result` — Execution result logged (target, function, success, attempts)
+//! - `fee_estimated` — Fee estimation completed (total_fee, surge_pricing)
+//! - `simulation_result` — Pre-execution simulation result (target, function, success)
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
@@ -366,6 +371,14 @@ impl RouterExecution {
         })
     }
 
+    /// Get the current admin address.
+    pub fn admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("router-execution not initialized")
+    }
+
     /// Get cumulative execution statistics.
     ///
     /// Returns `(total_executions, total_errors)`.
@@ -426,6 +439,12 @@ mod tests {
         let admin = Address::generate(&env);
         let result = client.try_initialize(&admin, &6);
         assert_eq!(result, Err(Ok(ExecutionError::InvalidConfig)));
+    }
+
+    #[test]
+    fn test_admin_returns_initialized_admin() {
+        let (_, admin, client) = setup();
+        assert_eq!(client.admin(), admin);
     }
 
     #[test]
