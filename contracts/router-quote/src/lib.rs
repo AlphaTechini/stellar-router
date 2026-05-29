@@ -602,6 +602,9 @@ impl RouterQuote {
         if request.amount <= 0 {
             return Err(QuoteError::InvalidAmount);
         }
+        if request.fee_bps > 10_000 {
+            return Err(QuoteError::InvalidFee);
+        }
 
         // Protocol fee: amount * fee_bps / 10000
         let protocol_fee = request.amount * request.fee_bps as i128 / 10_000;
